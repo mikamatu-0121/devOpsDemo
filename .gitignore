@@ -1,0 +1,19 @@
+# AWS SAM build artifacts
+.aws-sam/
+
+# VS Code settings
+.vscode/
+
+# Node.js dependencies
+node_modules/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Environment variables
+.env
+.env.local
+
+# SAM configuration
+samconfig.toml

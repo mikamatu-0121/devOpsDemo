@@ -1,0 +1,239 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  DevOps Agent CloudWatch WebHook Tutorial
+  
+  This tutorial demonstrates how to automatically trigger AWS DevOps Agent via WebHook
+  when a CloudWatch Alarm enters ALARM state.
+
+Parameters:
+  SecretArn:
+    Type: String
+    Description: ARN of the Secrets Manager secret containing WebHook URL and Secret
+
+Globals:
+  Function:
+    Timeout: 10
+    MemorySize: 128
+    Runtime: nodejs24.x
+
+Resources:
+  # Error Generator Lambda Function
+  # This function intentionally fails to trigger CloudWatch Alarm
+  ErrorGeneratorFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/error-generator/
+      Handler: index.handler
+      Runtime: nodejs24.x
+      Description: Lambda function that intentionally fails by attempting SNS publish without permissions
+      ReservedConcurrentExecutions: 5
+      KmsKeyArn: !GetAtt LambdaEnvironmentEncryptionKey.Arn
+      Environment:
+        Variables:
+          SNS_TOPIC_ARN: !Ref DemoSNSTopic
+      Role: !GetAtt ErrorGeneratorRole.Arn
+
+  # IAM Role for Error Generator Lambda
+  # Intentionally excludes SNS publish permissions to cause failure
+  ErrorGeneratorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        # Only CloudWatch Logs permissions - no SNS permissions
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Description: IAM role for Error Generator Lambda (CloudWatch Logs only, no SNS permissions)
+
+  # KMS Key for SNS Topic Encryption
+  # Encrypts messages in the SNS topic (though none will be published in this demo)
+  SNSEncryptionKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: KMS key for SNS topic encryption in DevOps Agent tutorial
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: Enable IAM User Permissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+          - Sid: Allow SNS to use the key
+            Effect: Allow
+            Principal:
+              Service: sns.amazonaws.com
+            Action:
+              - 'kms:Decrypt'
+              - 'kms:GenerateDataKey'
+            Resource: '*'
+
+  # KMS Key for Lambda Environment Variable Encryption
+  # Encrypts environment variables for both Lambda functions
+  LambdaEnvironmentEncryptionKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: KMS key for Lambda environment variable encryption in DevOps Agent tutorial
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: Enable IAM User Permissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+          - Sid: Allow Lambda to use the key
+            Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action:
+              - 'kms:Decrypt'
+              - 'kms:DescribeKey'
+            Resource: '*'
+
+  # SNS Topic (target for Error Generator)
+  # This topic serves as the target for the Error Generator Lambda
+  # The Lambda will fail when attempting to publish due to missing permissions
+  DemoSNSTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: DevOps Agent Tutorial Target Topic
+      TopicName: !Sub '${AWS::StackName}-DemoTopic'
+      KmsMasterKeyId: !Ref SNSEncryptionKey
+
+  # WebHook Executor Lambda Function
+  # This function sends HTTP POST requests to DevOps Agent WebHook endpoint
+  # when triggered by CloudWatch Alarms
+  WebHookExecutorFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/webhook-executor/
+      Handler: index.handler
+      Runtime: nodejs24.x
+      Timeout: 30
+      Description: Lambda function that invokes AWS DevOps Agent WebHook when CloudWatch Alarm triggers
+      ReservedConcurrentExecutions: 10
+      KmsKeyArn: !GetAtt LambdaEnvironmentEncryptionKey.Arn
+      Environment:
+        Variables:
+          SECRET_ARN: !Ref SecretArn
+      Role: !GetAtt WebHookExecutorRole.Arn
+
+  # Lambda Permission for CloudWatch Alarm to invoke WebHook Executor
+  # This permission allows CloudWatch Alarms to directly invoke the WebHook Executor Lambda
+  # using the lambda.alarms.cloudwatch.amazonaws.com service principal
+  WebHookExecutorInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref WebHookExecutorFunction
+      Action: lambda:InvokeFunction
+      Principal: lambda.alarms.cloudwatch.amazonaws.com
+      SourceAccount: !Ref AWS::AccountId
+
+  # IAM Role for WebHook Executor Lambda
+  # Includes CloudWatch Logs and Secrets Manager permissions
+  WebHookExecutorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        # CloudWatch Logs permissions
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: SecretsManagerReadPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource: !Ref SecretArn
+                Condition:
+                  StringEquals:
+                    'secretsmanager:SecretId': !Ref SecretArn
+      Description: IAM role for WebHook Executor Lambda (CloudWatch Logs and Secrets Manager)
+
+  # CloudWatch Alarm
+  # Monitors Error Generator Lambda for errors and triggers WebHook Executor
+  LambdaErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Triggers when Error Generator Lambda fails, invoking DevOps Agent via WebHook
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref ErrorGeneratorFunction
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !GetAtt WebHookExecutorFunction.Arn
+
+Outputs:
+  StackName:
+    Description: Name of the CloudFormation stack
+    Value: !Ref AWS::StackName
+    Export:
+      Name: !Sub '${AWS::StackName}-StackName'
+  
+  ErrorGeneratorFunctionName:
+    Description: Name of the Error Generator Lambda function (use this to invoke the function)
+    Value: !Ref ErrorGeneratorFunction
+    Export:
+      Name: !Sub '${AWS::StackName}-ErrorGeneratorFunctionName'
+  
+  ErrorGeneratorFunctionArn:
+    Description: ARN of the Error Generator Lambda function
+    Value: !GetAtt ErrorGeneratorFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-ErrorGeneratorFunctionArn'
+  
+  WebHookExecutorFunctionName:
+    Description: Name of the WebHook Executor Lambda function
+    Value: !Ref WebHookExecutorFunction
+    Export:
+      Name: !Sub '${AWS::StackName}-WebHookExecutorFunctionName'
+  
+  WebHookExecutorFunctionArn:
+    Description: ARN of the WebHook Executor Lambda function
+    Value: !GetAtt WebHookExecutorFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-WebHookExecutorFunctionArn'
+  
+  SNSTopicArn:
+    Description: ARN of the demo SNS topic (target for Error Generator)
+    Value: !Ref DemoSNSTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-SNSTopicArn'
+  
+  LambdaErrorAlarmName:
+    Description: Name of the CloudWatch Alarm monitoring Lambda errors
+    Value: !Ref LambdaErrorAlarm
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaErrorAlarmName'
+  
+  LambdaErrorAlarmArn:
+    Description: ARN of the CloudWatch Alarm
+    Value: !GetAtt LambdaErrorAlarm.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaErrorAlarmArn'
