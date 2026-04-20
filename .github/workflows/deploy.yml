@@ -30,6 +30,8 @@ jobs:
             --no-confirm-changeset \
             --no-fail-on-empty-changeset \
             --stack-name devops-agent-webhook-tutoria \
-            --resolve-s3 \
+            --s3-bucket aws-sam-cli-managed-default-samclisourcebucket-svwyzl0gfhb8 \
+            --s3-prefix devops-agent-webhook-tutoria \
             --capabilities CAPABILITY_IAM \
+            --region ap-northeast-1 \
             --parameter-overrides "SecretArn=arn:aws:secretsmanager:ap-northeast-1:255126832980:secret:devops-agent-webhook-credentials-gR96LB"
