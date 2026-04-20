@@ -55,6 +55,7 @@ exports.handler = async (event) => {
   console.log(JSON.stringify({
     level: 'INFO', correlationId,
     message: 'Order data ingestion pipeline started',
+    version: '1.1.0',
     trigger: event.source || 'manual',
     timestamp: new Date().toISOString()
   }));
