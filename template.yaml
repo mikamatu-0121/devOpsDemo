@@ -111,6 +111,286 @@ Resources:
       TopicName: !Sub '${AWS::StackName}-DemoTopic'
       KmsMasterKeyId: !Ref SNSEncryptionKey
 
+  # ============================================================
+  # Complex Error Generator - Multi-service pipeline failure demo
+  # Pipeline: S3 Read → JSON Parse → DynamoDB Write (fails due to missing permissions)
+  # ============================================================
+
+  # S3 Bucket for pipeline source data
+  DataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${AWS::StackName}-data-${AWS::AccountId}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  # DynamoDB Table (target for pipeline writes)
+  OrdersTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${AWS::StackName}-Orders'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: PK
+          AttributeType: S
+        - AttributeName: SK
+          AttributeType: S
+      KeySchema:
+        - AttributeName: PK
+          KeyType: HASH
+        - AttributeName: SK
+          KeyType: RANGE
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+
+  # Complex Error Generator Lambda Function
+  ComplexErrorGeneratorFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/complex-error-generator/
+      Handler: index.handler
+      Runtime: nodejs24.x
+      Timeout: 30
+      Description: >
+        Multi-service data pipeline that reads from S3, parses JSON, and attempts
+        DynamoDB writes. Intentionally lacks DynamoDB permissions to simulate
+        a realistic production failure scenario.
+      ReservedConcurrentExecutions: 5
+      KmsKeyArn: !GetAtt LambdaEnvironmentEncryptionKey.Arn
+      Environment:
+        Variables:
+          DATA_BUCKET_NAME: !Ref DataBucket
+          TABLE_NAME: !Ref OrdersTable
+      Role: !GetAtt ComplexErrorGeneratorRole.Arn
+
+  # IAM Role for Complex Error Generator
+  # Has S3 read/write permissions but intentionally NO DynamoDB permissions
+  ComplexErrorGeneratorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: S3ReadWritePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                Resource: !Sub '${DataBucket.Arn}/*'
+        - PolicyName: DynamoDBWritePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                Resource: !GetAtt OrdersTable.Arn
+      Description: >
+        IAM role for Complex Error Generator Lambda.
+        Has full S3 and DynamoDB permissions. The failure is caused by
+        a code bug (schema version mismatch), not by missing permissions.
+
+  # ============================================================
+  # DynamoDB Permission Error Generator
+  # Pipeline: S3 Read → Parse → Transform → DynamoDB Write (fails - no permission)
+  # ============================================================
+
+  DynamoErrorGeneratorFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/dynamo-error-generator/
+      Handler: index.handler
+      Runtime: nodejs24.x
+      Timeout: 30
+      Description: >
+        Multi-service pipeline that succeeds through S3 read, parse, and transform,
+        but fails at DynamoDB write due to missing dynamodb:PutItem permission.
+      ReservedConcurrentExecutions: 5
+      KmsKeyArn: !GetAtt LambdaEnvironmentEncryptionKey.Arn
+      Environment:
+        Variables:
+          DATA_BUCKET_NAME: !Ref DataBucket
+          TABLE_NAME: !Ref OrdersTable
+      Role: !GetAtt DynamoErrorGeneratorRole.Arn
+
+  # IAM Role: has S3 permissions but NO DynamoDB permissions
+  DynamoErrorGeneratorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: S3ReadWritePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                Resource: !Sub '${DataBucket.Arn}/*'
+      Description: >
+        IAM role for DynamoDB Error Generator Lambda.
+        Has S3 read/write but intentionally NO DynamoDB permissions.
+
+  DynamoErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: >
+        Triggers when DynamoDB Error Generator pipeline fails,
+        invoking DevOps Agent via WebHook
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref DynamoErrorGeneratorFunction
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !GetAtt WebHookExecutorFunction.Arn
+
+  WebHookExecutorInvokePermissionDynamo:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref WebHookExecutorFunction
+      Action: lambda:InvokeFunction
+      Principal: lambda.alarms.cloudwatch.amazonaws.com
+      SourceAccount: !Ref AWS::AccountId
+
+  # CloudWatch Alarm for Complex Error Generator
+  ComplexErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: >
+        Triggers when Complex Error Generator pipeline fails,
+        invoking DevOps Agent via WebHook for root cause analysis
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref ComplexErrorGeneratorFunction
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !GetAtt WebHookExecutorFunction.Arn
+
+  # Lambda Permission for CloudWatch Alarm to invoke WebHook Executor (Complex Error)
+  WebHookExecutorInvokePermissionComplex:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref WebHookExecutorFunction
+      Action: lambda:InvokeFunction
+      Principal: lambda.alarms.cloudwatch.amazonaws.com
+      SourceAccount: !Ref AWS::AccountId
+
+  # ============================================================
+  # OOM Error Generator - Memory exhaustion during data processing
+  # Pipeline: S3 Read → Parse → Build In-Memory Index (OOM here)
+  # ============================================================
+
+  OOMErrorGeneratorFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/oom-error-generator/
+      Handler: index.handler
+      Runtime: nodejs24.x
+      Timeout: 60
+      MemorySize: 128
+      Description: >
+        Batch analytics Lambda that reads large dataset from S3 and builds
+        in-memory aggregation indexes. Crashes with OOM when dataset exceeds
+        the 128MB memory allocation.
+      ReservedConcurrentExecutions: 5
+      KmsKeyArn: !GetAtt LambdaEnvironmentEncryptionKey.Arn
+      Environment:
+        Variables:
+          DATA_BUCKET_NAME: !Ref DataBucket
+      Role: !GetAtt OOMErrorGeneratorRole.Arn
+
+  OOMErrorGeneratorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: S3ReadWritePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                Resource: !Sub '${DataBucket.Arn}/*'
+      Description: IAM role for OOM Error Generator Lambda with full S3 permissions.
+
+  OOMErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: >
+        Triggers when OOM Error Generator crashes due to memory exhaustion,
+        invoking DevOps Agent via WebHook
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref OOMErrorGeneratorFunction
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !GetAtt WebHookExecutorFunction.Arn
+
+  WebHookExecutorInvokePermissionOOM:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref WebHookExecutorFunction
+      Action: lambda:InvokeFunction
+      Principal: lambda.alarms.cloudwatch.amazonaws.com
+      SourceAccount: !Ref AWS::AccountId
+
   # WebHook Executor Lambda Function
   # This function sends HTTP POST requests to DevOps Agent WebHook endpoint
   # when triggered by CloudWatch Alarms
@@ -237,3 +517,51 @@ Outputs:
     Value: !GetAtt LambdaErrorAlarm.Arn
     Export:
       Name: !Sub '${AWS::StackName}-LambdaErrorAlarmArn'
+
+  ComplexErrorGeneratorFunctionName:
+    Description: Name of the Complex Error Generator Lambda function
+    Value: !Ref ComplexErrorGeneratorFunction
+    Export:
+      Name: !Sub '${AWS::StackName}-ComplexErrorGeneratorFunctionName'
+
+  ComplexErrorAlarmName:
+    Description: Name of the CloudWatch Alarm for Complex Error Generator
+    Value: !Ref ComplexErrorAlarm
+    Export:
+      Name: !Sub '${AWS::StackName}-ComplexErrorAlarmName'
+
+  DataBucketName:
+    Description: Name of the S3 bucket for pipeline data
+    Value: !Ref DataBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-DataBucketName'
+
+  OrdersTableName:
+    Description: Name of the DynamoDB table for orders
+    Value: !Ref OrdersTable
+    Export:
+      Name: !Sub '${AWS::StackName}-OrdersTableName'
+
+  OOMErrorGeneratorFunctionName:
+    Description: Name of the OOM Error Generator Lambda function
+    Value: !Ref OOMErrorGeneratorFunction
+    Export:
+      Name: !Sub '${AWS::StackName}-OOMErrorGeneratorFunctionName'
+
+  OOMErrorAlarmName:
+    Description: Name of the CloudWatch Alarm for OOM Error Generator
+    Value: !Ref OOMErrorAlarm
+    Export:
+      Name: !Sub '${AWS::StackName}-OOMErrorAlarmName'
+
+  DynamoErrorGeneratorFunctionName:
+    Description: Name of the DynamoDB Error Generator Lambda function
+    Value: !Ref DynamoErrorGeneratorFunction
+    Export:
+      Name: !Sub '${AWS::StackName}-DynamoErrorGeneratorFunctionName'
+
+  DynamoErrorAlarmName:
+    Description: Name of the CloudWatch Alarm for DynamoDB Error Generator
+    Value: !Ref DynamoErrorAlarm
+    Export:
+      Name: !Sub '${AWS::StackName}-DynamoErrorAlarmName'
