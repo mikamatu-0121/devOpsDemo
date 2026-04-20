@@ -1,0 +1,35 @@
+name: Deploy SAM Stack
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/setup-sam@v2
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::255126832980:role/GitHubActions-DevOpsDemo-Deploy
+          aws-region: ap-northeast-1
+
+      - name: SAM Build
+        run: sam build
+
+      - name: SAM Deploy
+        run: |
+          sam deploy \
+            --no-confirm-changeset \
+            --no-fail-on-empty-changeset \
+            --stack-name devops-agent-webhook-tutoria \
+            --resolve-s3 \
+            --capabilities CAPABILITY_IAM \
+            --parameter-overrides "SecretArn=arn:aws:secretsmanager:ap-northeast-1:255126832980:secret:devops-agent-webhook-credentials-gR96LB"
